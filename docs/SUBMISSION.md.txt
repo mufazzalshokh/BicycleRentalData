@@ -1,0 +1,502 @@
+# ASPEX Data Engineer Task - Bicycle Rental Data Warehouse
+## Complete Solution
+
+---
+
+## PART 1: SCHEMA IMPROVEMENTS & ALTER STATEMENTS
+
+### Improvements Rationale and Implementation
+
+#### 1. Expand Client Name Field
+```sql
+ALTER TABLE [Client] ALTER COLUMN [Name] varchar(100) not null
+```
+**Why:** Original field limited to 10 characters. Real names like "Aleksandr" or "Ekaterina" exceed this. This causes data truncation and data quality issues. Increased to 100 characters to accommodate any realistic name length.
+
+---
+
+#### 2. Expand Staff Name Field
+```sql
+ALTER TABLE [Staff] ALTER COLUMN [Name] varchar(100) not null
+```
+**Why:** Same rationale as Client names - 10 characters is insufficient for employee names. Preventing truncation ensures accurate HR records and reports.
+
+---
+
+#### 3. Add DateTime Columns to RentBook
+```sql
+ALTER TABLE [RentBook] ADD [StartTime] datetime null
+ALTER TABLE [RentBook] ADD [EndTime] datetime null
+```
+**Why:** Original design only captured rental date without specific time. For accurate billing and tracking, we need exact start/end timestamps. These columns allow precise rental duration calculation rather than relying solely on the "Time" field.
+
+---
+
+#### 4. Add Primary Key to DetailForBicycle Junction Table
+```sql
+ALTER TABLE [DetailForBicycle] ADD PRIMARY KEY ([BicycleId], [DetailId])
+```
+**Why:** Junction tables must have primary keys to prevent duplicate relationships (e.g., same part assigned to same bike twice). Composite key prevents data redundancy.
+
+---
+
+#### 5. Add Primary Key to ServiceBook
+```sql
+ALTER TABLE [ServiceBook] ADD PRIMARY KEY ([BicycleId], [DetailId], [Date], [StaffId])
+```
+**Why:** Service records need a unique constraint to prevent duplicate maintenance records for the same bike/part combination on the same date by the same staff member.
+
+---
+
+#### 6-8. Add Check Constraints for Price Validation
+```sql
+ALTER TABLE [Bicycle] ADD CONSTRAINT CK_RentPrice_Positive CHECK ([RentPrice] > 0)
+ALTER TABLE [Detail] ADD CONSTRAINT CK_DetailPrice_Positive CHECK ([Price] > 0)
+ALTER TABLE [ServiceBook] ADD CONSTRAINT CK_ServicePrice_Positive CHECK ([Price] > 0)
+```
+**Why:** Prevents negative or zero prices which would corrupt financial data. Database-level validation is better than application-level because it's enforced for all data sources.
+
+---
+
+#### 9-11. Add Performance Indexes
+```sql
+CREATE INDEX IX_RentBook_Date ON [RentBook]([Date])
+CREATE INDEX IX_ServiceBook_Date ON [ServiceBook]([Date])
+CREATE INDEX IX_Staff_Date ON [Staff]([Date])
+```
+**Why:** Analytical queries frequently filter by date fields (monthly revenue, tenure calculation, etc.). Without indexes, these queries perform full table scans. Indexes dramatically improve query performance as data grows.
+
+---
+
+## PART 2: FIVE ANALYTICAL T-SQL QUERIES
+
+### Query 1: Top 5 Most Profitable Bicycles
+**Purpose:** Identify which bikes generate the most profit (revenue minus repair costs)
+
+```sql
+SELECT TOP 5
+    b.Id,
+    b.Brand,
+    COUNT(DISTINCT r.Id) as RentCount,
+    SUM(r.Time * b.RentPrice) as TotalRentRevenue,
+    ISNULL(SUM(sb.Price), 0) as TotalRepairCost,
+    SUM(r.Time * b.RentPrice) - ISNULL(SUM(sb.Price), 0) as NetProfit
+FROM [Bicycle] b
+LEFT JOIN [RentBook] r ON b.Id = r.BicycleId
+LEFT JOIN [ServiceBook] sb ON b.Id = sb.BicycleId
+GROUP BY b.Id, b.Brand
+ORDER BY NetProfit DESC
+```
+
+**Key Joins:** Bicycle → RentBook, Bicycle → ServiceBook (3 tables)
+**Business Value:** Shows which bikes are worth maintaining vs. retiring.
+
+---
+
+### Query 2: Monthly Revenue Trend with Growth Percentage
+**Purpose:** Track revenue month-over-month to identify business trends
+
+```sql
+SELECT
+    YEAR(r.[Date]) as Year,
+    MONTH(r.[Date]) as Month,
+    DATEFROMPARTS(YEAR(r.[Date]), MONTH(r.[Date]), 1) as MonthStart,
+    SUM(r.[Time] * b.RentPrice) as MonthlyRevenue,
+    LAG(SUM(r.[Time] * b.RentPrice)) OVER (ORDER BY YEAR(r.[Date]), MONTH(r.[Date])) as PrevMonthRevenue,
+    CAST(
+        (SUM(r.[Time] * b.RentPrice) - 
+         LAG(SUM(r.[Time] * b.RentPrice)) OVER (ORDER BY YEAR(r.[Date]), MONTH(r.[Date]))) 
+        * 100.0 / 
+        LAG(SUM(r.[Time] * b.RentPrice)) OVER (ORDER BY YEAR(r.[Date]), MONTH(r.[Date]))
+        AS DECIMAL(10, 2)
+    ) as GrowthPercentage
+FROM [RentBook] r
+JOIN [Bicycle] b ON r.BicycleId = b.Id
+WHERE r.Paid = 1
+GROUP BY YEAR(r.[Date]), MONTH(r.[Date])
+ORDER BY Year, Month
+```
+
+**Key Features:** Window function (LAG) for YoY comparison
+**Business Value:** Dashboard metric showing business health and growth rate.
+
+---
+
+### Query 3: Staff Performance Analysis
+**Purpose:** Evaluate employee productivity and revenue contribution
+
+```sql
+SELECT
+    s.Id,
+    s.Name,
+    s.[Date] as HireDate,
+    COUNT(DISTINCT r.Id) as RentalsHandled,
+    COUNT(DISTINCT sb.BicycleId) as ServicesPerformed,
+    SUM(r.[Time] * b.RentPrice) as RentRevenue,
+    ISNULL(SUM(sb.Price), 0) as RepairRevenue
+FROM [Staff] s
+LEFT JOIN [RentBook] r ON s.Id = r.StaffId
+LEFT JOIN [Bicycle] b ON r.BicycleId = b.Id
+LEFT JOIN [ServiceBook] sb ON s.Id = sb.StaffId
+GROUP BY s.Id, s.Name, s.[Date]
+ORDER BY RentalsHandled DESC, RepairRevenue DESC
+```
+
+**Key Joins:** Staff → RentBook → Bicycle, Staff → ServiceBook (4 tables)
+**Business Value:** Identifies top performers for bonuses, underperformers for training.
+
+---
+
+### Query 4: Bikes Requiring Maintenance Priority
+**Purpose:** Identify bikes with high repair costs relative to rental revenue
+
+```sql
+SELECT TOP 10
+    b.Id,
+    b.Brand,
+    b.RentPrice,
+    SUM(r.[Time] * b.RentPrice) as TotalRentRevenue,
+    ISNULL(SUM(sb.Price), 0) as TotalRepairCost,
+    CAST(
+        ISNULL(SUM(sb.Price), 0) * 100.0 / 
+        NULLIF(SUM(r.[Time] * b.RentPrice), 0)
+        AS DECIMAL(10, 2)
+    ) as RepairCostPercentage,
+    COUNT(DISTINCT sb.Date) as RepairEventCount
+FROM [Bicycle] b
+LEFT JOIN [RentBook] r ON b.Id = r.BicycleId
+LEFT JOIN [ServiceBook] sb ON b.Id = sb.BicycleId
+GROUP BY b.Id, b.Brand, b.RentPrice
+HAVING ISNULL(SUM(sb.Price), 0) > 0
+ORDER BY RepairCostPercentage DESC
+```
+
+**Key Joins:** Bicycle → RentBook, Bicycle → ServiceBook (3 tables)
+**Business Value:** Identifies "money-losing" bikes that need major repair or retirement.
+
+---
+
+### Query 5: Client Rental Patterns and Payment Reliability
+**Purpose:** Segment customers by loyalty, payment behavior, and spending
+
+```sql
+SELECT
+    c.Id,
+    c.Name,
+    c.Country,
+    COUNT(r.Id) as TotalRentals,
+    SUM(CASE WHEN r.Paid = 1 THEN 1 ELSE 0 END) as PaidRentals,
+    SUM(CASE WHEN r.Paid = 0 THEN 1 ELSE 0 END) as UnpaidRentals,
+    CAST(
+        SUM(CASE WHEN r.Paid = 1 THEN 1 ELSE 0 END) * 100.0 / 
+        COUNT(r.Id)
+        AS DECIMAL(10, 2)
+    ) as PaymentRate,
+    SUM(r.[Time] * b.RentPrice) as TotalSpent,
+    AVG(r.[Time]) as AvgRentalHours
+FROM [Client] c
+LEFT JOIN [RentBook] r ON c.Id = r.ClientId
+LEFT JOIN [Bicycle] b ON r.BicycleId = b.Id
+GROUP BY c.Id, c.Name, c.Country
+ORDER BY TotalSpent DESC
+```
+
+**Key Joins:** Client → RentBook → Bicycle (3 tables)
+**Business Value:** Identifies VIP customers, payment risks, and marketing opportunities.
+
+---
+
+## PART 3: BONUS DATA MART & STORED PROCEDURE
+
+### Data Mart Table Structure
+```sql
+CREATE TABLE [BonusDataMart]
+(
+    [Id] int IDENTITY(1,1) not null,
+    [Year] int not null,
+    [Month] int not null,
+    [StaffId] int not null,
+    [StaffName] varchar(100) not null,
+    [TenureMonths] int not null,
+    [TenurePercent] decimal(5, 2) not null,
+    [RentRevenue] decimal(15, 2) not null,
+    [RentBonusPercent] decimal(5, 2) not null,
+    [RepairRevenue] decimal(15, 2) not null,
+    [RepairBonusPercent] decimal(5, 2) not null,
+    [BonusAmount] decimal(15, 2) not null,
+    [CreatedDate] datetime default getdate(),
+    [LoadedDate] datetime null,
+    primary key([Id]),
+    FOREIGN KEY ([StaffId]) REFERENCES [Staff] ([Id])
+)
+```
+
+**Purpose:** Pre-calculated bonus data ready for dashboard visualization. One row per staff member per month.
+
+---
+
+### Bonus Calculation Formula Implementation
+The bonus formula: **X = (P1 × X1 + P2 × X2) × X0**
+
+Where:
+- **P1** = Total rental revenue employee handled
+- **X1** = 30% (rental bonus percentage)
+- **P2** = Total repair work performed
+- **X2** = 80% (repair bonus percentage)
+- **X0** = Tenure percentage (5%, 10%, or 15%)
+
+**Tenure Brackets:**
+- Less than 1 year: 5% bonus
+- 1-2 years: 10% bonus
+- 2+ years: 15% bonus
+
+---
+
+### Stored Procedure: sp_LoadBonusDataMart
+```sql
+CREATE PROCEDURE sp_LoadBonusDataMart
+    @Year INT = NULL,
+    @Month INT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON
+    
+    DECLARE @TargetYear INT = ISNULL(@Year, YEAR(GETDATE()))
+    DECLARE @TargetMonth INT = ISNULL(@Month, MONTH(GETDATE()))
+    DECLARE @TargetDate DATE = DATEFROMPARTS(@TargetYear, @TargetMonth, 1)
+    DECLARE @EndOfMonth DATE = EOMONTH(@TargetDate)
+    
+    -- Delete existing records for this month to allow re-runs
+    DELETE FROM [BonusDataMart]
+    WHERE [Year] = @TargetYear AND [Month] = @TargetMonth
+    
+    -- Insert bonus calculations for all staff
+    INSERT INTO [BonusDataMart]
+    (
+        [Year],
+        [Month],
+        [StaffId],
+        [StaffName],
+        [TenureMonths],
+        [TenurePercent],
+        [RentRevenue],
+        [RentBonusPercent],
+        [RepairRevenue],
+        [RepairBonusPercent],
+        [BonusAmount],
+        [LoadedDate]
+    )
+    SELECT
+        @TargetYear as [Year],
+        @TargetMonth as [Month],
+        s.[Id],
+        s.[Name],
+        DATEDIFF(MONTH, s.[Date], @EndOfMonth) as [TenureMonths],
+        CASE
+            WHEN DATEDIFF(MONTH, s.[Date], @EndOfMonth) < 12 THEN 5.0
+            WHEN DATEDIFF(MONTH, s.[Date], @EndOfMonth) < 24 THEN 10.0
+            ELSE 15.0
+        END as [TenurePercent],
+        ISNULL(SUM(rb.[Time] * bc.RentPrice), 0) as [RentRevenue],
+        30.0 as [RentBonusPercent],
+        ISNULL(SUM(sb.Price), 0) as [RepairRevenue],
+        80.0 as [RepairBonusPercent],
+        CAST(
+            (
+                ISNULL(SUM(rb.[Time] * bc.RentPrice), 0) * 0.30 +
+                ISNULL(SUM(sb.Price), 0) * 0.80
+            ) *
+            CASE
+                WHEN DATEDIFF(MONTH, s.[Date], @EndOfMonth) < 12 THEN 0.05
+                WHEN DATEDIFF(MONTH, s.[Date], @EndOfMonth) < 24 THEN 0.10
+                ELSE 0.15
+            END
+        AS DECIMAL(15, 2)) as [BonusAmount],
+        GETDATE()
+    FROM [Staff] s
+    LEFT JOIN [RentBook] rb ON s.Id = rb.StaffId
+        AND YEAR(rb.[Date]) = @TargetYear
+        AND MONTH(rb.[Date]) = @TargetMonth
+        AND rb.Paid = 1
+    LEFT JOIN [Bicycle] bc ON rb.BicycleId = bc.Id
+    LEFT JOIN [ServiceBook] sb ON s.Id = sb.StaffId
+        AND YEAR(sb.[Date]) = @TargetYear
+        AND MONTH(sb.[Date]) = @TargetMonth
+    GROUP BY
+        s.[Id],
+        s.[Name],
+        s.[Date]
+    
+    PRINT 'Data Mart loaded successfully'
+END
+```
+
+**Usage Examples:**
+```sql
+-- Load current month
+EXEC sp_LoadBonusDataMart
+
+-- Load specific month
+EXEC sp_LoadBonusDataMart @Year = 2025, @Month = 1
+
+-- View results
+SELECT * FROM [BonusDataMart] ORDER BY [BonusAmount] DESC
+```
+
+---
+
+## PART 4: AUTOMATION STRATEGIES
+
+### Question: How to automate data mart loading on a daily/monthly basis?
+
+### Answer with Multiple Approaches:
+
+#### 1. **SQL Server Agent (RECOMMENDED for On-Premises)**
+**Pros:**
+- Native to SQL Server, no external dependencies
+- Easy to configure via SSMS GUI
+- Built-in retry logic and notifications
+- No additional infrastructure needed
+
+**Cons:**
+- Only available for on-premises SQL Server
+- Requires SQL Server Agent service running
+
+**Implementation:**
+- Create SQL Agent job scheduled for 1st of each month at 00:00
+- Job step executes: `EXEC sp_LoadBonusDataMart`
+- Add notification for job failures
+- Logs available in Job History
+
+---
+
+#### 2. **Azure Data Factory (RECOMMENDED for Cloud)**
+**Pros:**
+- Serverless, fully managed service
+- Scales automatically with demand
+- Native integration with Azure ecosystem
+- Built-in monitoring, logging, and alerting
+- Can orchestrate complex pipelines
+
+**Cons:**
+- Cloud-only (Azure subscription required)
+- Additional cost per pipeline execution
+- Learning curve for new users
+
+**Implementation:**
+- Create ADF pipeline with "Execute SQL Script" activity
+- Configure to call stored procedure
+- Add trigger for monthly execution (1st of month)
+- Set up Azure Monitor alerts for failures
+
+---
+
+#### 3. **Python/C# Scheduler with Windows Task Scheduler**
+**Pros:**
+- Flexible, can add custom business logic
+- No database agent required
+- Can integrate with other systems
+
+**Cons:**
+- External script maintenance burden
+- Requires script/application always available
+- Manual error handling required
+
+**Implementation:**
+```python
+import pyodbc
+from datetime import datetime
+import logging
+
+def load_bonus_data_mart(year=None, month=None):
+    conn_string = 'Driver={ODBC Driver 17 for SQL Server};Server=localhost;Database=BicycleRental;Trusted_Connection=yes;'
+    conn = pyodbc.connect(conn_string)
+    cursor = conn.cursor()
+    
+    if year is None or month is None:
+        now = datetime.now()
+        year = now.year
+        month = now.month
+    
+    cursor.execute(f'EXEC sp_LoadBonusDataMart @Year = {year}, @Month = {month}')
+    conn.commit()
+    logging.info(f'Bonus data loaded for {year}-{month:02d}')
+    conn.close()
+
+# Schedule with Windows Task Scheduler (run monthly at 00:00)
+if __name__ == '__main__':
+    load_bonus_data_mart()
+```
+
+---
+
+#### 4. **Apache Airflow (for Enterprise)**
+**Pros:**
+- Enterprise-grade orchestration
+- Complex DAG (Directed Acyclic Graph) support
+- Full monitoring and retry capabilities
+- Version control friendly
+
+**Cons:**
+- Overkill for simple monthly task
+- Requires infrastructure setup
+- Steeper learning curve
+
+---
+
+#### 5. **Application-Level Trigger**
+**Pros:**
+- Application controls load timing
+- Integrates with business logic
+- No external job required
+
+**Cons:**
+- Depends on application availability
+- Risk of missed loads if app is down
+
+---
+
+### **RECOMMENDED APPROACH FOR THIS PROJECT:**
+
+**Primary:** SQL Server Agent (if on-premises) or Azure Data Factory (if cloud)
+
+**Configuration:**
+- Schedule: 1st day of each month at 00:00 (or 02:00 for off-peak)
+- Retry: 3 attempts with 5-minute intervals
+- Notification: Email on failure
+- Monitoring: Check data mart row count daily to verify load occurred
+
+**Current Procedure Capability:**
+- Stored procedure already handles current month if no parameters provided
+- Can be called multiple times safely (deletes previous month's data first)
+- Idempotent design allows flexible scheduling
+
+---
+
+## APPENDIX: TEST DATA SUMMARY
+
+- **Bicycles:** 8 units (Giant, Trek, Specialized, Cannondale, Scott, Cube, Merida, Kona)
+- **Clients:** 8 customers with varied rental history
+- **Staff:** 7 employees with varied tenure (1 month to 4+ years)
+- **Rental Records:** 40 transactions (Sept 2024 - Jan 2025)
+- **Service Records:** 15 maintenance events
+- **Details (Parts):** 8 component types
+
+**Data Quality:**
+- All foreign keys valid
+- Mix of paid/unpaid rentals
+- Varied tenure levels for bonus calculation testing
+- Historical data spanning 5 months for trend analysis
+
+---
+
+## SUBMISSION CHECKLIST
+
+- [x] Database created and tested
+- [x] All schema improvements applied with documentation
+- [x] Test data populated
+- [x] Five analytical queries documented with business context
+- [x] Bonus data mart implemented
+- [x] Stored procedure functional and tested
+- [x] Automation strategies documented with pros/cons
+- [x] This document prepared for submission
